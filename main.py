@@ -174,3 +174,9 @@ def upload_complete(payload: CompletePayload) -> dict[str, Any]:
             "data_type": folder,
         }
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8003)

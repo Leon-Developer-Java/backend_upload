@@ -26,6 +26,9 @@ cd D:\weather_prediction_system\backend_upload
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+# 方式一：直接运行
+python main.py
+# 方式二：uvicorn（支持热重载）
 uvicorn main:app --reload --host 127.0.0.1 --port 8003
 ```
 
