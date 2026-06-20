@@ -5,6 +5,7 @@
 """
 
 import hashlib
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
-# 最终落盘根目录，复用现有展示后端的 data 目录
-TARGET_DATA_DIR = Path(r"D:\weather_prediction_system\backend\data")
+TARGET_DATA_DIR = Path(os.getenv("DATA_DIR", r"D:\weather_prediction_system\backend\data"))
 # 分片临时目录
 TEMP_DIR = Path(__file__).resolve().parent / "tmp_chunks"
 
