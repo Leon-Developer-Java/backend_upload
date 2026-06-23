@@ -15,7 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
-TARGET_DATA_DIR = Path(os.getenv("DATA_DIR", r"D:\weather_prediction_system\backend\data"))
+TARGET_DATA_DIR = Path(
+    os.getenv(
+        "DATA_DIR",
+        str(Path(__file__).resolve().parents[1] / "backend_system" / "data"),
+    )
+)
 # 分片临时目录
 TEMP_DIR = Path(__file__).resolve().parent / "tmp_chunks"
 
