@@ -14,6 +14,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from auth import install_auth
+
 
 TARGET_DATA_DIR = Path(
     os.getenv(
@@ -38,6 +40,9 @@ WAIT_PROCESS = "wait_process"
 
 
 app = FastAPI(title="Weather Data Upload Backend", version="0.1.0")
+
+# CORS 必须在 install_auth 之后 add_middleware，保证 401/403 响应带 CORS 头
+install_auth(app, [("/api", 2)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -175,7 +180,7 @@ def upload_complete(payload: CompletePayload) -> dict[str, Any]:
     return ok(
         {
             "file_name": safe_name,
-            "directory": str(dest_dir).replace("\\", "/") + "/",
+            "directory": f"/data/{folder}/{WAIT_PROCESS}/",
             "data_type": folder,
         }
     )
