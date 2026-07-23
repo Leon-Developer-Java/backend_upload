@@ -4,3 +4,4 @@ pydantic==2.10.4
 python-multipart==0.0.20
 pyjwt
 python-dotenv
+sqlalchemy>=2.0,<3.0
