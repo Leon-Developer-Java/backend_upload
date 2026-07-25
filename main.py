@@ -15,12 +15,13 @@ import uuid
 from copy import deepcopy
 from collections import Counter
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
@@ -53,7 +54,7 @@ TMP_STORAGE_ROOT = Path(
 ).resolve()
 TEMP_DIR = TMP_STORAGE_ROOT / "uploads"
 PRODUCT_DATA_ROOT = Path(
-    os.getenv("PRODUCT_DATA_ROOT", str(WORKSPACE_ROOT / "backend" / "data"))
+    os.getenv("PRODUCT_DATA_ROOT", str(WORKSPACE_ROOT / "backend_system" / "data"))
 ).resolve()
 
 
@@ -105,6 +106,10 @@ EXPECTED_STEP_SECONDS = {
     "FY3": 300,
     "HIMAWARI": 600,
 }
+
+NOWCAST_FRAME_COUNT = 5
+NOWCAST_STEP_SECONDS = 360
+NOWCAST_VARIABLE = "observation.prdt_crf_raw_log"
 
 
 engine, _ = init_database(import_users=True)
@@ -242,6 +247,77 @@ def _resource_meta_path(resource: dict[str, Any]) -> Path:
     if not candidate.is_file():
         raise HTTPException(status_code=409, detail="该数据的 meta.json 不存在。")
     return candidate
+
+
+def _nowcast_input_path(resource: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    if str(resource.get("data_type") or "").upper() != "RADAR":
+        raise HTTPException(status_code=400, detail="短临降水预报只接受雷达数据。")
+
+    meta_path = _resource_meta_path(resource)
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=409, detail="雷达数据的 meta.json 无法读取。") from exc
+
+    if str(meta.get("file_format") or "") != "RADAR_NC_CAP_FMT":
+        raise HTTPException(status_code=409, detail="该雷达数据不是模型支持的 CAP_FMT NetCDF。")
+
+    raw_variables = {
+        str(item.get("raw_name") or "")
+        for item in meta.get("variables") or []
+        if isinstance(item, dict)
+    }
+    if NOWCAST_VARIABLE not in raw_variables:
+        raise HTTPException(
+            status_code=409,
+            detail=f"雷达数据缺少短临模型变量 {NOWCAST_VARIABLE}。",
+        )
+
+    candidates: list[Any] = [meta.get("source_file")]
+    candidates.extend(
+        item.get("netcdf")
+        for item in meta.get("variables") or []
+        if isinstance(item, dict)
+    )
+    for value in candidates:
+        if not value:
+            continue
+        source = Path(str(value))
+        source = source.resolve() if source.is_absolute() else (PRODUCT_DATA_ROOT / source).resolve()
+        try:
+            source.relative_to(PRODUCT_DATA_ROOT)
+        except ValueError:
+            continue
+        if source.is_file() and source.suffix.lower() == ".nc":
+            return source, meta
+
+    raw_source = _resolve_existing_raw(str(resource.get("source_path") or ""))
+    if raw_source is not None and raw_source.suffix.lower() == ".nc":
+        return raw_source, meta
+
+    raise HTTPException(status_code=409, detail="雷达数据对应的模型输入 NetCDF 不存在。")
+
+
+def _select_latest_nowcast_window(
+    candidates: list[dict[str, Any]],
+    *,
+    frame_count: int = NOWCAST_FRAME_COUNT,
+    step_seconds: int = NOWCAST_STEP_SECONDS,
+) -> list[dict[str, Any]]:
+    by_time: dict[datetime, dict[str, Any]] = {}
+    for item in candidates:
+        timestamp = _parse_resource_time(str(item.get("valid_time") or ""))
+        if timestamp is not None and timestamp not in by_time:
+            by_time[timestamp] = item
+
+    for end_time in sorted(by_time, reverse=True):
+        expected = [
+            end_time - timedelta(seconds=step_seconds * offset)
+            for offset in range(frame_count - 1, -1, -1)
+        ]
+        if all(timestamp in by_time for timestamp in expected):
+            return [by_time[timestamp] for timestamp in expected]
+    return []
 
 
 def _resource_times(resource: dict[str, Any]) -> list[str]:
@@ -676,6 +752,105 @@ def catalog_resource(request: Request, file_uuid: str) -> dict[str, Any]:
     if resource is None:
         raise HTTPException(status_code=404, detail="数据不存在或无权访问。")
     return ok(_resource_payload(resource, include_meta=True))
+
+
+@app.get("/api/catalog/nowcast/latest")
+def latest_nowcast_inputs(request: Request) -> dict[str, Any]:
+    """Return the newest five model-ready radar frames across all users."""
+    user = request_user(request)
+    if int(user.get("role") or 0) < 2:
+        raise HTTPException(status_code=403, detail="权限不足。")
+
+    # Short-term forecasting is a shared operational workflow: role >= 2 can
+    # select any successfully parsed radar resource, regardless of its owner.
+    resources, _ = list_display_resources(
+        engine,
+        str(user["uuid"]),
+        3,
+        "RADAR",
+        limit=500,
+        offset=0,
+    )
+    candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    for resource in resources:
+        try:
+            source, meta = _nowcast_input_path(resource)
+            payload = _resource_payload(resource)
+            times = payload.get("times") or []
+            if len(times) != 1:
+                raise HTTPException(status_code=409, detail="短临输入必须是一文件一时次。")
+            candidates.append(
+                {
+                    "file_uuid": str(resource["file_uuid"]),
+                    "file_name": str(resource.get("original_file_name") or source.name),
+                    "valid_time": str(times[0]),
+                    "owner_uuid": str(resource.get("user_uuid") or ""),
+                    "file_size": int(source.stat().st_size),
+                    "variable": NOWCAST_VARIABLE,
+                    "extent": meta.get("bbox") or (meta.get("weather_info") or {}).get("extent"),
+                }
+            )
+        except HTTPException as exc:
+            rejected.append(
+                {
+                    "file_uuid": str(resource.get("file_uuid") or ""),
+                    "reason": str(exc.detail),
+                }
+            )
+
+    selected = _select_latest_nowcast_window(candidates)
+    if not selected:
+        latest_time = max((item["valid_time"] for item in candidates), default=None)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "数据库中没有找到连续5帧、间隔6分钟的模型可用雷达数据。",
+                "model_ready_count": len(candidates),
+                "latest_time": latest_time,
+                "rejected_count": len(rejected),
+            },
+        )
+
+    return ok(
+        {
+            "model_id": "precipitation_nowcasting",
+            "run_mode": "forecast",
+            "frames": selected,
+            "frame_count": NOWCAST_FRAME_COUNT,
+            "step_seconds": NOWCAST_STEP_SECONDS,
+            "forecast_frames": 20,
+            "forecast_minutes": 120,
+        },
+        message="已选择数据库中最新的连续5帧雷达数据。",
+    )
+
+
+@app.get("/api/catalog/nowcast/resources/{file_uuid}/input")
+def nowcast_resource_input(request: Request, file_uuid: str) -> FileResponse:
+    """Stream one validated CAP_FMT NetCDF to the dedicated model backend."""
+    user = request_user(request)
+    if int(user.get("role") or 0) < 2:
+        raise HTTPException(status_code=403, detail="权限不足。")
+    resource = get_display_resource(
+        engine,
+        str(user["uuid"]),
+        3,
+        file_uuid,
+    )
+    if resource is None:
+        raise HTTPException(status_code=404, detail="雷达数据不存在或尚未解析成功。")
+    source, _ = _nowcast_input_path(resource)
+    original_name = Path(str(resource.get("original_file_name") or source.name)).name
+    return FileResponse(
+        path=source,
+        media_type="application/x-netcdf",
+        filename=original_name,
+        headers={
+            "X-Weather-File-Name": original_name,
+            "X-Weather-File-UUID": file_uuid,
+        },
+    )
 
 
 @app.post("/api/catalog/series")

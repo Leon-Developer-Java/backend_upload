@@ -17,6 +17,8 @@
 - `POST /api/upload/complete`：加合并锁、顺序合并、计算 SHA-256、raw 落盘并写入 `public_info(parse_status=pending)`。
 - `GET /api/upload/tasks`、`GET /api/upload/tasks/{file_uuid}`：返回当前用户的解析任务和状态。
 - `POST /api/upload/tasks/{file_uuid}/retry`：将当前用户的失败任务重新入队。
+- `GET /api/catalog/nowcast/latest`：从数据库选择最新一组可执行的 5 帧 CAP_FMT 雷达数据，供智能体生成用户确认卡片。
+- `GET /api/catalog/nowcast/resources/{file_uuid}/input`：向模型服务安全提供已校验的原始 CAP_FMT 输入，不暴露服务器文件路径。
 - JWT 除角色外还查询共享 `users` 表，校验账号状态与 `token_version`。
 - 相同用户、相同 `data_type`、相同 SHA-256 的文件使用硬链接复用 raw；原任务解析成功后，Worker 复用明细和 WebP 路径。
 
