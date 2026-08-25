@@ -1010,6 +1010,11 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
                         digest.update(block)
                         output.write(block)
 
+        if total_size == 0:
+            merged.unlink(missing_ok=True)
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail="上传文件为空，未创建解析任务。")
+
         file_hash = digest.hexdigest()
         duplicate = find_user_duplicate(engine, user_uuid, data_type, file_hash)
         file_uuid = str(uuid.uuid4())
