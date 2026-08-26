@@ -34,6 +34,8 @@ WORKSPACE_ROOT = BASE_DIR.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
+from acquisition import AcquisitionService
+from catalog_reconcile import reconcile_catalog
 from DB.migrate import init_database
 from DB.repository import (
     create_or_get_satellite_collection,
@@ -134,11 +136,19 @@ NOWCAST_VARIABLE = "observation.prdt_crf_raw_log"
 
 
 engine, _ = init_database(import_users=True)
+acquisition_service = AcquisitionService(engine, RAW_STORAGE_ROOT)
 
 app = FastAPI(title="Weather Data Upload Backend", version="0.2.0")
 
 # Data catalog is readable by signed-in users; uploads still require role 2.
-install_auth(app, [("/api/catalog", 1), ("/api", 2)])
+install_auth(
+    app,
+    [
+        ("/api/catalog", {"GET": 1, "POST": 2}),
+        ("/api/acquisition", {"GET": 1, "POST": 2}),
+        ("/api", 2),
+    ],
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,6 +166,51 @@ app.add_middleware(
 
 def ok(data: Any = None, message: str = "success") -> dict[str, Any]:
     return {"code": 0, "data": data, "message": message}
+
+
+@app.on_event("startup")
+def start_acquisition_scheduler() -> None:
+    acquisition_service.start()
+
+
+@app.on_event("shutdown")
+def stop_acquisition_scheduler() -> None:
+    acquisition_service.stop()
+
+
+def _acquisition_type(value: str) -> str:
+    normalized = normalize_data_type(value)
+    if normalized not in SATELLITE_UPLOAD_TYPES:
+        raise HTTPException(status_code=400, detail="自动采集仅支持 FY3 和 Himawari。")
+    return normalized
+
+
+@app.get("/api/acquisition/{data_type}/status")
+def acquisition_status(data_type: str) -> dict[str, Any]:
+    return ok(acquisition_service.status(_acquisition_type(data_type)))
+
+
+@app.get("/api/acquisition/{data_type}/scenes")
+def acquisition_scenes(
+    data_type: str,
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    normalized = _acquisition_type(data_type)
+    items = acquisition_service.scenes(normalized, limit=limit)
+    return ok({"data_type": normalized, "items": items, "total": len(items)})
+
+
+@app.post("/api/acquisition/{data_type}/sync")
+def acquisition_sync(data_type: str) -> dict[str, Any]:
+    normalized = _acquisition_type(data_type)
+    try:
+        return ok(acquisition_service.sync(normalized), "自动采集同步完成")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"自动采集失败：{exc}") from exc
 
 
 def safe_file_id(file_id: str) -> str:
@@ -241,7 +296,10 @@ def _satellite_descriptor(file_name: str, data_type: str) -> dict[str, Any]:
             )
         role = "science" if FY3_SCIENCE_RE.match(name) else "geo"
         return {
-            "scene_key": f"FY3{match.group('sat').upper()}_{match.group('date')}_{match.group('time')}",
+            "scene_key": (
+                f"FY3{match.group('sat').upper()}_{match.group('date')}_{match.group('time')}_"
+                "MERSI_GBAL_1000M"
+            ),
             "role": role,
             "role_group": role,
             "group_roles": [role],
@@ -266,7 +324,7 @@ def _satellite_descriptor(file_name: str, data_type: str) -> dict[str, Any]:
         return {
             "scene_key": (
                 f"H{match.group('sat')}_{match.group('date')}_{match.group('time')}_"
-                f"{match.group('region').upper()}"
+                f"{match.group('region').upper()}_{match.group('resolution').upper()}"
             ),
             "role": f"{band}:S{segment:02d}",
             "role_group": f"{band}:",
@@ -823,6 +881,17 @@ def catalog_resources(
     })
 
 
+@app.post("/api/catalog/reconcile")
+def catalog_reconcile(
+    data_type: str = Query(...),
+    apply: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return ok(reconcile_catalog(engine, PRODUCT_DATA_ROOT, data_type, apply=apply))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/catalog/resources/{file_uuid}")
 def catalog_resource(request: Request, file_uuid: str) -> dict[str, Any]:
     user = request_user(request)
@@ -1002,12 +1071,16 @@ def prepare_upload_collections(
                     detail=f"同一场景的 {group.rstrip(':')} 分段总数不一致。",
                 )
             replacements[group] = roles
+        expected_roles = set(_initial_satellite_roles(data_type))
+        for prefix, roles in replacements.items():
+            expected_roles = {role for role in expected_roles if not role.startswith(prefix)}
+            expected_roles.update(roles)
         collection = create_or_get_satellite_collection(
             engine,
             user["uuid"],
             data_type,
             scene_key,
-            _initial_satellite_roles(data_type),
+            sorted(expected_roles),
             role_replacements=replacements,
         )
         collections.append(collection)
