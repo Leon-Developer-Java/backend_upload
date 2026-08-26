@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -35,13 +36,19 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from DB.migrate import init_database
 from DB.repository import (
+    create_or_get_satellite_collection,
+    create_satellite_collection_upload_task,
     create_upload_task,
     find_user_duplicate,
+    get_collection_member_task_by_role,
     get_display_resource,
     get_upload_task_by_session,
+    get_user_satellite_collection,
     get_user_task,
     list_display_resources,
+    list_user_satellite_collections,
     list_user_tasks,
+    retry_user_satellite_collection,
     retry_user_task,
 )
 
@@ -91,10 +98,24 @@ ALLOWED_SUFFIXES = {
     "Himawari": {".hsd", ".dat", ".bz2"},
 }
 
-# FY-3 and Himawari still use the multi-file raw-scene endpoints on port 8002.
-# Enqueuing either type here would create a task that the single-file worker
-# cannot complete because its companion files are not part of this session.
-QUEUED_UPLOAD_TYPES = {"ERA5", "GFS", "ECMWF", "CMA", "Radar", "WRF"}
+QUEUED_UPLOAD_TYPES = {"ERA5", "GFS", "ECMWF", "CMA", "Radar", "WRF", "FY3", "Himawari"}
+SATELLITE_UPLOAD_TYPES = {"FY3", "Himawari"}
+HIMAWARI_DEFAULT_BANDS = ("B01", "B02", "B03", "B13")
+HIMAWARI_DEFAULT_SEGMENTS = max(1, int(os.getenv("HIMAWARI_EXPECTED_SEGMENTS", "10")))
+FY3_SCIENCE_RE = re.compile(
+    r"^FY3(?P<sat>[A-Z])_MERSI_GBAL_L1_(?P<date>\d{8})_(?P<time>\d{4})_1000M_MS\.HDF$",
+    re.IGNORECASE,
+)
+FY3_GEO_RE = re.compile(
+    r"^FY3(?P<sat>[A-Z])_MERSI_GBAL_L1_(?P<date>\d{8})_(?P<time>\d{4})_GEO1K_MS\.HDF$",
+    re.IGNORECASE,
+)
+HIMAWARI_HSD_RE = re.compile(
+    r"^HS_H(?P<sat>\d{2})_(?P<date>\d{8})_(?P<time>\d{4})_"
+    r"(?P<band>B\d{2})_(?P<region>[A-Z0-9]+)_(?P<resolution>R\d{2})_"
+    r"S(?P<segment>\d{2})(?P<total>\d{2})\.DAT(?:\.bz2)?$",
+    re.IGNORECASE,
+)
 
 EXPECTED_STEP_SECONDS = {
     "ERA5": 3600,
@@ -209,7 +230,67 @@ def _validate_queued_upload_type(data_type: str) -> None:
         )
 
 
-def _task_payload(task: dict[str, Any], *, duplicate_content: bool | None = None) -> dict[str, Any]:
+def _satellite_descriptor(file_name: str, data_type: str) -> dict[str, Any]:
+    name = Path(file_name).name
+    if data_type == "FY3":
+        match = FY3_SCIENCE_RE.match(name) or FY3_GEO_RE.match(name)
+        if match is None:
+            raise HTTPException(
+                status_code=400,
+                detail="FY-3 文件名必须是同一时次的 1000M_MS.HDF 或 GEO1K_MS.HDF。",
+            )
+        role = "science" if FY3_SCIENCE_RE.match(name) else "geo"
+        return {
+            "scene_key": f"FY3{match.group('sat').upper()}_{match.group('date')}_{match.group('time')}",
+            "role": role,
+            "role_group": role,
+            "group_roles": [role],
+        }
+    if data_type == "Himawari":
+        match = HIMAWARI_HSD_RE.match(name)
+        if match is None:
+            raise HTTPException(
+                status_code=400,
+                detail="葵花文件名必须符合 HS_Hxx_YYYYMMDD_HHMM_Bxx_REGION_Rxx_Sxxxx.DAT[.bz2]。",
+            )
+        band = match.group("band").upper()
+        if band not in HIMAWARI_DEFAULT_BANDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"集合 Worker 当前只接收默认通道：{','.join(HIMAWARI_DEFAULT_BANDS)}。",
+            )
+        segment = int(match.group("segment"))
+        total = int(match.group("total"))
+        if segment < 1 or total < 1 or segment > total:
+            raise HTTPException(status_code=400, detail="HSD 分段编号非法。")
+        return {
+            "scene_key": (
+                f"H{match.group('sat')}_{match.group('date')}_{match.group('time')}_"
+                f"{match.group('region').upper()}"
+            ),
+            "role": f"{band}:S{segment:02d}",
+            "role_group": f"{band}:",
+            "group_roles": [f"{band}:S{index:02d}" for index in range(1, total + 1)],
+        }
+    raise HTTPException(status_code=400, detail="只有 FY-3 与葵花需要集合准备。")
+
+
+def _initial_satellite_roles(data_type: str) -> list[str]:
+    if data_type == "FY3":
+        return ["science", "geo"]
+    return [
+        f"{band}:S{index:02d}"
+        for band in HIMAWARI_DEFAULT_BANDS
+        for index in range(1, HIMAWARI_DEFAULT_SEGMENTS + 1)
+    ]
+
+
+def _task_payload(
+    task: dict[str, Any],
+    *,
+    duplicate_content: bool | None = None,
+    collection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = {
         "file_uuid": task.get("file_uuid"),
         "collection_uuid": task.get("collection_uuid"),
@@ -232,6 +313,8 @@ def _task_payload(task: dict[str, Any], *, duplicate_content: bool | None = None
     }
     if duplicate_content is not None:
         payload["duplicate_content"] = duplicate_content
+    if collection is not None:
+        payload["collection"] = collection
     return payload
 
 
@@ -344,7 +427,7 @@ def _canonical_resource_time(value: Any) -> str | None:
 
 
 def _meta_times(meta: dict[str, Any]) -> set[str]:
-    candidates: list[Any] = []
+    candidates: list[Any] = [meta.get("observation_time"), meta.get("time")]
     candidates.extend(meta.get("times") if isinstance(meta.get("times"), list) else [])
     for frame in meta.get("frames") if isinstance(meta.get("frames"), list) else []:
         if isinstance(frame, dict):
@@ -878,17 +961,122 @@ def catalog_series(request: Request, payload: CatalogSeriesPayload) -> dict[str,
     return ok(_merge_wrf_series(items))
 
 
+class CollectionPrepareFile(BaseModel):
+    file_id: str = Field(min_length=1, max_length=1024)
+    file_name: str = Field(min_length=1, max_length=255)
+    file_size: int = Field(ge=0, le=MAX_FILE_SIZE)
+    last_modified: int = Field(default=0, ge=0)
+
+
+class CollectionPreparePayload(BaseModel):
+    data_type: str
+    files: list[CollectionPrepareFile] = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/upload/collections/prepare")
+def prepare_upload_collections(
+    request: Request,
+    payload: CollectionPreparePayload,
+) -> dict[str, Any]:
+    user = request_user(request)
+    data_type = normalize_data_type(payload.data_type)
+    if data_type not in SATELLITE_UPLOAD_TYPES:
+        raise HTTPException(status_code=400, detail="集合准备只适用于 FY-3 与葵花卫星文件。")
+
+    grouped: dict[str, list[tuple[CollectionPrepareFile, dict[str, Any]]]] = {}
+    for item in payload.files:
+        safe_name = _safe_original_name(item.file_name, data_type)
+        descriptor = _satellite_descriptor(safe_name, data_type)
+        grouped.setdefault(descriptor["scene_key"], []).append((item, descriptor))
+
+    assignments: list[dict[str, Any]] = []
+    collections: list[dict[str, Any]] = []
+    for scene_key, items in grouped.items():
+        replacements: dict[str, list[str]] = {}
+        for _item, descriptor in items:
+            group = descriptor["role_group"]
+            roles = descriptor["group_roles"]
+            if group in replacements and replacements[group] != roles:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"同一场景的 {group.rstrip(':')} 分段总数不一致。",
+                )
+            replacements[group] = roles
+        collection = create_or_get_satellite_collection(
+            engine,
+            user["uuid"],
+            data_type,
+            scene_key,
+            _initial_satellite_roles(data_type),
+            role_replacements=replacements,
+        )
+        collections.append(collection)
+        for item, descriptor in items:
+            assignments.append({
+                "file_id": item.file_id,
+                "file_name": item.file_name,
+                "collection_uuid": collection["collection_uuid"],
+                "scene_key": scene_key,
+                "role": descriptor["role"],
+                "collection_status": collection["status"],
+                "missing_roles": collection["missing_roles"],
+            })
+    return ok({"assignments": assignments, "collections": collections}, "集合准备完成")
+
+
+@app.get("/api/upload/collections")
+def upload_collections(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    user = request_user(request)
+    items, total = list_user_satellite_collections(
+        engine,
+        user["uuid"],
+        limit=limit,
+        offset=offset,
+    )
+    return ok({"items": items, "total": total, "limit": limit, "offset": offset})
+
+
+@app.get("/api/upload/collections/{collection_uuid}")
+def upload_collection(request: Request, collection_uuid: str) -> dict[str, Any]:
+    user = request_user(request)
+    collection = get_user_satellite_collection(engine, user["uuid"], collection_uuid)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="集合不存在或无权访问。")
+    return ok(collection)
+
+
+@app.post("/api/upload/collections/{collection_uuid}/retry")
+def retry_upload_collection(request: Request, collection_uuid: str) -> dict[str, Any]:
+    user = request_user(request)
+    collection = retry_user_satellite_collection(engine, user["uuid"], collection_uuid)
+    if collection is None:
+        raise HTTPException(status_code=409, detail="集合不存在、尚未完整或当前状态不可重试。")
+    return ok(collection, "集合已重新进入解析队列")
+
+
 @app.get("/api/upload/status")
 def upload_status(request: Request, file_id: str) -> dict[str, Any]:
     user = request_user(request)
     session_id = safe_file_id(file_id)
     completed = get_upload_task_by_session(engine, user["uuid"], session_id)
     if completed:
+        collection = None
+        if completed.get("collection_uuid"):
+            collection = get_user_satellite_collection(
+                engine,
+                user["uuid"],
+                str(completed["collection_uuid"]),
+            )
         return ok({
             "uploaded": [],
             "completed": _task_payload(
                 completed,
                 duplicate_content=_is_duplicate_content(completed),
+                collection=collection,
             ),
         })
 
@@ -950,6 +1138,7 @@ class CompletePayload(BaseModel):
     total_chunks: int = Field(ge=1)
     data_type: str
     collection_uuid: str | None = None
+    collection_role: str | None = None
 
 
 @app.post("/api/upload/complete")
@@ -961,13 +1150,39 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
     _validate_total_chunks(payload.total_chunks)
     safe_name = _safe_original_name(payload.file_name, data_type)
     upload_session_id = safe_file_id(payload.file_id)
+    collection: dict[str, Any] | None = None
+    collection_role: str | None = None
+    if data_type in SATELLITE_UPLOAD_TYPES:
+        if not payload.collection_uuid or not payload.collection_role:
+            raise HTTPException(status_code=400, detail="卫星文件必须先准备集合并提交 collection_uuid 与 collection_role。")
+        descriptor = _satellite_descriptor(safe_name, data_type)
+        if payload.collection_role != descriptor["role"]:
+            raise HTTPException(status_code=409, detail="collection_role 与文件名解析出的角色不一致。")
+        collection = get_user_satellite_collection(engine, user_uuid, payload.collection_uuid)
+        if collection is None:
+            raise HTTPException(status_code=404, detail="集合不存在或无权访问。")
+        if collection.get("data_type") != data_type or collection.get("scene_key") != descriptor["scene_key"]:
+            raise HTTPException(status_code=409, detail="文件不属于指定的卫星集合。")
+        if collection.get("status") not in {"collecting", "ready"}:
+            raise HTTPException(status_code=409, detail="集合已开始解析或已经结束，不能再追加成员。")
+        collection_role = payload.collection_role
+    elif payload.collection_uuid or payload.collection_role:
+        raise HTTPException(status_code=400, detail="非卫星文件不能指定集合信息。")
 
     completed = get_upload_task_by_session(engine, user_uuid, upload_session_id)
     if completed:
+        completed_collection = None
+        if completed.get("collection_uuid"):
+            completed_collection = get_user_satellite_collection(
+                engine,
+                user_uuid,
+                str(completed["collection_uuid"]),
+            )
         return ok(
             _task_payload(
                 completed,
                 duplicate_content=_is_duplicate_content(completed),
+                collection=completed_collection,
             )
         )
 
@@ -975,10 +1190,18 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
     with _merge_lock(target_dir):
         completed = get_upload_task_by_session(engine, user_uuid, upload_session_id)
         if completed:
+            completed_collection = None
+            if completed.get("collection_uuid"):
+                completed_collection = get_user_satellite_collection(
+                    engine,
+                    user_uuid,
+                    str(completed["collection_uuid"]),
+                )
             return ok(
                 _task_payload(
                     completed,
                     duplicate_content=_is_duplicate_content(completed),
+                    collection=completed_collection,
                 )
             )
 
@@ -1016,7 +1239,39 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
             raise HTTPException(status_code=400, detail="上传文件为空，未创建解析任务。")
 
         file_hash = digest.hexdigest()
-        duplicate = find_user_duplicate(engine, user_uuid, data_type, file_hash)
+        if collection is not None and collection_role is not None:
+            existing_member = get_collection_member_task_by_role(
+                engine,
+                str(collection["collection_uuid"]),
+                collection_role,
+            )
+            if existing_member is not None:
+                if existing_member.get("file_hash") != file_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"集合角色 {collection_role} 已存在且内容不同，不能覆盖。",
+                    )
+                merged.unlink(missing_ok=True)
+                shutil.rmtree(target_dir, ignore_errors=True)
+                refreshed = get_user_satellite_collection(
+                    engine,
+                    user_uuid,
+                    str(collection["collection_uuid"]),
+                )
+                return ok(
+                    _task_payload(
+                        existing_member,
+                        duplicate_content=True,
+                        collection=refreshed,
+                    ),
+                    "相同集合成员已存在，已复用",
+                )
+
+        duplicate = (
+            find_user_duplicate(engine, user_uuid, data_type, file_hash)
+            if collection is None
+            else None
+        )
         file_uuid = str(uuid.uuid4())
         suffix = Path(safe_name).suffix
         destination = _raw_destination(user_uuid, data_type, file_uuid, suffix)
@@ -1035,24 +1290,30 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
                 merged.replace(destination)
 
             relative_source = destination.relative_to(RAW_STORAGE_ROOT).as_posix()
-            task = create_upload_task(
-                engine,
-                {
-                    "file_uuid": file_uuid,
-                    "upload_session_id": upload_session_id,
-                    "user_uuid": user_uuid,
-                    "collection_uuid": payload.collection_uuid,
-                    "data_type": data_type,
-                    "file_type": suffix.lstrip(".").upper() or "WRF",
-                    "original_file_name": safe_name,
-                    "stored_file_name": destination.name,
-                    "source_path": relative_source,
-                    "file_size": total_size,
-                    "file_hash": file_hash,
-                    "source_file_uuid": source_file_uuid,
-                    "remark": "same-user SHA-256 duplicate" if source_file_uuid else None,
-                },
-            )
+            task_values = {
+                "file_uuid": file_uuid,
+                "upload_session_id": upload_session_id,
+                "user_uuid": user_uuid,
+                "collection_uuid": payload.collection_uuid,
+                "data_type": data_type,
+                "file_type": suffix.lstrip(".").upper() or "WRF",
+                "original_file_name": safe_name,
+                "stored_file_name": destination.name,
+                "source_path": relative_source,
+                "file_size": total_size,
+                "file_hash": file_hash,
+                "source_file_uuid": source_file_uuid,
+                "remark": "same-user SHA-256 duplicate" if source_file_uuid else None,
+            }
+            if collection is not None and collection_role is not None:
+                task, collection = create_satellite_collection_upload_task(
+                    engine,
+                    task_values,
+                    collection_uuid=str(collection["collection_uuid"]),
+                    role=collection_role,
+                )
+            else:
+                task = create_upload_task(engine, task_values)
         except IntegrityError:
             if destination.exists():
                 destination.unlink()
@@ -1063,13 +1324,29 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
             completed = get_upload_task_by_session(engine, user_uuid, upload_session_id)
             if completed:
                 shutil.rmtree(target_dir, ignore_errors=True)
+                completed_collection = None
+                if completed.get("collection_uuid"):
+                    completed_collection = get_user_satellite_collection(
+                        engine,
+                        user_uuid,
+                        str(completed["collection_uuid"]),
+                    )
                 return ok(
                     _task_payload(
                         completed,
                         duplicate_content=_is_duplicate_content(completed),
+                        collection=completed_collection,
                     )
                 )
             raise
+        except ValueError as exc:
+            if destination.exists():
+                destination.unlink()
+            try:
+                destination.parent.rmdir()
+            except OSError:
+                pass
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception:
             if destination.exists():
                 destination.unlink()
@@ -1080,7 +1357,19 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
             raise
 
         shutil.rmtree(target_dir, ignore_errors=True)
-        return ok(_task_payload(task, duplicate_content=bool(source_file_uuid)), "上传完成，已进入解析队列")
+        message = "上传完成，集合已进入解析队列" if collection and collection.get("status") == "ready" else "上传完成"
+        if collection and collection.get("status") == "collecting":
+            message = "上传完成，等待集合其余成员"
+        elif collection is None:
+            message = "上传完成，已进入解析队列"
+        return ok(
+            _task_payload(
+                task,
+                duplicate_content=bool(source_file_uuid),
+                collection=collection,
+            ),
+            message,
+        )
 
 
 @app.get("/api/upload/tasks")
@@ -1091,7 +1380,18 @@ def upload_tasks(
 ) -> dict[str, Any]:
     user = request_user(request)
     tasks, total = list_user_tasks(engine, user["uuid"], limit=limit, offset=offset)
-    return ok({"items": [_task_payload(task) for task in tasks], "total": total, "limit": limit, "offset": offset})
+    items = []
+    collections: dict[str, dict[str, Any] | None] = {}
+    for task in tasks:
+        collection = None
+        collection_uuid = task.get("collection_uuid")
+        if collection_uuid:
+            key = str(collection_uuid)
+            if key not in collections:
+                collections[key] = get_user_satellite_collection(engine, user["uuid"], key)
+            collection = collections[key]
+        items.append(_task_payload(task, collection=collection))
+    return ok({"items": items, "total": total, "limit": limit, "offset": offset})
 
 
 @app.get("/api/upload/tasks/{file_uuid}")
@@ -1100,12 +1400,25 @@ def upload_task(request: Request, file_uuid: str) -> dict[str, Any]:
     task = get_user_task(engine, user["uuid"], file_uuid)
     if task is None:
         raise HTTPException(status_code=404, detail="上传任务不存在。")
-    return ok(_task_payload(task))
+    collection = None
+    if task.get("collection_uuid"):
+        collection = get_user_satellite_collection(
+            engine,
+            user["uuid"],
+            str(task["collection_uuid"]),
+        )
+    return ok(_task_payload(task, collection=collection))
 
 
 @app.post("/api/upload/tasks/{file_uuid}/retry")
 def retry_upload_task(request: Request, file_uuid: str) -> dict[str, Any]:
     user = request_user(request)
+    existing = get_user_task(engine, user["uuid"], file_uuid)
+    if existing and existing.get("collection_uuid"):
+        raise HTTPException(
+            status_code=409,
+            detail="卫星集合成员不能单独重试，请使用集合重试接口。",
+        )
     task = retry_user_task(engine, user["uuid"], file_uuid)
     if task is None:
         raise HTTPException(status_code=409, detail="仅失败任务可以重新进入解析队列。")

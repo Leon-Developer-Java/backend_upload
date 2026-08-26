@@ -267,7 +267,7 @@ update_time
 
 ### `POST /api/upload/complete`
 
-请求类型为 `application/json`，字段为 `file_id`、`file_name`、`total_chunks`、`data_type`，可选 `collection_uuid`。响应包含：
+请求类型为 `application/json`，字段为 `file_id`、`file_name`、`total_chunks`、`data_type`。FY-3/Himawari 还必须提交由 prepare 返回的 `collection_uuid` 和 `collection_role`。响应包含：
 
 ```json
 {
@@ -286,6 +286,15 @@ update_time
 原始文件的 `source_path` 只保存在数据库中，不通过上传接口返回前端。
 
 `/complete` 必须具备幂等性。相同用户、相同上传会话重复请求时，应返回同一个已完成结果，不能再次覆盖文件或创建重复的 `public_info` 记录。
+
+### 卫星集合接口
+
+- `POST /api/upload/collections/prepare`：按服务端文件名规则生成或复用 collecting/ready 集合，返回每个文件的场景、角色和缺失角色。
+- `GET /api/upload/collections`：读取当前用户的集合列表。
+- `GET /api/upload/collections/{collection_uuid}`：读取集合成员、完整性和解析状态。
+- `POST /api/upload/collections/{collection_uuid}/retry`：把完整且 failed 的集合整体重新入队，禁止单独重试成员。
+
+FY-3 需要同场景 `science + geo`；Himawari 默认需要 B01、B02、B03、B13 的全部 HSD 分段。集合完整前成员为 `waiting_collection`，完整后仅 leader 进入 `pending`，Worker 领取时所有成员一起进入 `running`，最终一起成为 `success` 或 `failed`。展示资产只归属 leader，避免每个物理分段重复生成资产记录。
 
 ## 上传完成流程
 
@@ -308,9 +317,12 @@ update_time
 接收：receiving -> success
                 -> failed
 
-解析：pending -> running -> success
+解析：普通文件 pending -> running -> success
                     |      -> failed
                     +-- 租约过期后重试或恢复为 pending
+
+集合：collecting -> ready -> running -> success
+                          |         -> failed -> ready（整体重试）
 ```
 
 解析 Worker 不扫描 `wait_process` 或其他数据目录。它应从数据库领取任务，并使用数据库条件更新实现抢占，例如仅将满足以下条件的记录改为 `running`：
