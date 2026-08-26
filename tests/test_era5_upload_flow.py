@@ -93,7 +93,7 @@ class Era5UploadFlowTests(unittest.TestCase):
             ).scalar_one()
         self.assertEqual(count, 0)
 
-    def test_normal_and_same_user_duplicate_are_queued_once_each(self) -> None:
+    def test_same_user_duplicate_reuses_original_without_new_task(self) -> None:
         content = b"synthetic-era5-content"
         first_id = f"normal-{uuid.uuid4()}"
         second_id = f"duplicate-{uuid.uuid4()}"
@@ -109,7 +109,47 @@ class Era5UploadFlowTests(unittest.TestCase):
         second_data = second["data"]
         self.assertEqual(second_data["parse_status"], "pending")
         self.assertTrue(second_data["duplicate_content"])
-        self.assertNotEqual(first_data["file_uuid"], second_data["file_uuid"])
+        self.assertEqual(first_data["file_uuid"], second_data["file_uuid"])
+        self.assertFalse(upload_main.chunk_dir(self.user_uuid, second_id).exists())
+        with upload_main.engine.connect() as connection:
+            count = connection.execute(
+                select(func.count()).select_from(public_info).where(
+                    public_info.c.user_uuid == self.user_uuid,
+                    public_info.c.file_hash == first_data["file_hash"],
+                )
+            ).scalar_one()
+        self.assertEqual(count, 1)
+
+    def test_cma_single_frames_are_grouped_by_observed_cadence(self) -> None:
+        resources = []
+        for index, hour in enumerate((0, 3, 6, 9)):
+            valid_time = f"2022-01-02T{hour:02d}:00:00Z"
+            resources.append({
+                "file_uuid": f"cma-{index}",
+                "data_type": "CMA",
+                "original_file_name": f"cma-{hour:02d}.nc",
+                "visibility": "private",
+                "user_uuid": self.user_uuid,
+                "webp_count": 1,
+                "create_time": valid_time,
+                "parse_finished_at": valid_time,
+                "assets": [{
+                    "valid_time": valid_time,
+                    "element_key": "Tair_f_inst",
+                    "resolution_key": "native",
+                    "product_type": "CRA40-Land",
+                    "product_name": "hourly",
+                    "webp_url": f"/data/CMA/{index}.webp",
+                }],
+            })
+
+        items = upload_main._catalog_payloads(resources, "CMA")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["frame_count"], 4)
+        self.assertEqual(items[0]["expected_step_seconds"], 3 * 60 * 60)
+        self.assertTrue(items[0]["continuous"])
+        self.assertEqual(items[0]["file_uuids"], ["cma-0", "cma-1", "cma-2", "cma-3"])
 
 
 if __name__ == "__main__":

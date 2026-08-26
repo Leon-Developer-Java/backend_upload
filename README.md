@@ -20,7 +20,7 @@
 - `GET /api/catalog/nowcast/latest`：从数据库选择最新一组可执行的 5 帧 CAP_FMT 雷达数据，供智能体生成用户确认卡片。
 - `GET /api/catalog/nowcast/resources/{file_uuid}/input`：向模型服务安全提供已校验的原始 CAP_FMT 输入，不暴露服务器文件路径。
 - JWT 除角色外还查询共享 `users` 表，校验账号状态与 `token_version`。
-- 相同用户、相同 `data_type`、相同 SHA-256 的文件使用硬链接复用 raw；原任务解析成功后，Worker 复用明细和 WebP 路径。
+- 相同用户、相同 `data_type`、相同 SHA-256 的文件直接返回原任务；不再创建 raw 副本、`public_info` 记录或解析任务。
 
 标准单文件类型已改为“只上传一次、数据库入队、Worker 异步解析”，前端不再把同一文件提交给 8002 的 `/api/files/parse`。FY-3 和 Himawari 仍保留现有 `/api/files/raw-upload`、`raw-scenes`、`update` 多文件场景流程，本版本不强制迁移，避免破坏文件配对逻辑。
 
@@ -459,7 +459,7 @@ webp_files / default_webp
 
 第一版建议采用以下边界：
 
-- 同一用户上传相同 `data_type + file_hash`：保留一份物理文件；新记录可通过 `source_file_uuid` 指向已存在记录，且不重复解析。
+- 同一用户上传相同 `data_type + file_hash`：直接返回原记录并标记 `duplicate_content=true`，不创建新记录或物理文件。
 - 自动下载的公共文件出现相同 `data_type + file_hash`：复用公共资源并更新时间或来源状态，不重复解析。
 - 不同用户的私有上传：可以检测重复，但在权限模型完善前不要直接让一个用户引用另一个用户的私有记录或路径，以免泄露文件是否存在及访问权限。
 - `is_deleted=true` 的记录是否参与复用必须由恢复和保留策略决定，不能无条件复用。
@@ -561,4 +561,4 @@ public_info(data_type, file_hash, is_deleted)
 3. 展示 Service 已能扫描 `assets/{file_uuid}`，但返回结构仍来自 meta；后续再逐步切换为数据库优先查询。
 4. 自动下载、滚动保留、组织权限、配额、清理和监控仍属于下一阶段。
 
-本版已验证：分片上传、重复完成、真实 GFS 多要素多时次解析、任务失败回退、同内容 raw/解析结果复用、单 Worker 锁、明细路径入库和前端生产构建。生产上线前仍需补充并发压测、Worker 崩溃恢复演练和各数据类型样例回归。
+本版已验证：分片上传、重复完成、真实 GFS 多要素多时次解析、任务失败回退、同内容直接复用原任务、单 Worker 锁、明细路径入库和前端生产构建。生产上线前仍需补充并发压测、Worker 崩溃恢复演练和各数据类型样例回归。

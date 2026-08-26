@@ -61,7 +61,7 @@ TMP_STORAGE_ROOT = Path(
 ).resolve()
 TEMP_DIR = TMP_STORAGE_ROOT / "uploads"
 PRODUCT_DATA_ROOT = Path(
-    os.getenv("PRODUCT_DATA_ROOT", str(WORKSPACE_ROOT / "backend_system" / "data"))
+    os.getenv("PRODUCT_DATA_ROOT", str(WORKSPACE_ROOT / "backend" / "data"))
 ).resolve()
 
 
@@ -121,7 +121,8 @@ EXPECTED_STEP_SECONDS = {
     "ERA5": 3600,
     "GFS": 3600,
     "ECMWF": 10800,
-    "CMA": 3600,
+    # CMA products use different cadences; infer the step from each series.
+    "CMA": None,
     "RADAR": 600,
     "WRF": 3600,
     "FY3": 300,
@@ -706,7 +707,127 @@ def _merge_wrf_series(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _cma_series_key(payload: dict[str, Any]) -> tuple[Any, ...]:
+    attributes = payload.get("attributes") or {}
+    return (
+        str(payload.get("owner_uuid") or "public"),
+        str(payload.get("visibility") or "private"),
+        tuple(payload.get("elements") or []),
+        tuple(payload.get("resolutions") or []),
+        tuple(attributes.get("product_types") or []),
+        tuple(attributes.get("product_names") or []),
+    )
+
+
+def _series_step_seconds(items: list[dict[str, Any]], data_type: str) -> int | None:
+    parsed = sorted({
+        value
+        for item in items
+        if (value := _parse_resource_time(str(item.get("time_start") or ""))) is not None
+    })
+    default_step = EXPECTED_STEP_SECONDS.get(data_type)
+    if default_step:
+        return int(default_step)
+    deltas = [
+        int((right - left).total_seconds())
+        for left, right in zip(parsed, parsed[1:])
+        if right > left
+    ]
+    if not deltas:
+        return None
+    counts = Counter(deltas)
+    return min(counts, key=lambda value: (-counts[value], value))
+
+
+def _split_cma_series_runs(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    by_time: dict[str, dict[str, Any]] = {}
+    for item in sorted(
+        items,
+        key=lambda value: (
+            value.get("parse_finished_at") or value.get("create_time") or "",
+            value.get("file_uuid") or "",
+        ),
+        reverse=True,
+    ):
+        time_key = str(item.get("time_start") or "")
+        if time_key and time_key not in by_time:
+            by_time[time_key] = item
+    ordered = sorted(by_time.values(), key=lambda item: item.get("time_start") or "")
+    if len(ordered) < 2:
+        return [ordered] if ordered else []
+
+    expected_step = _series_step_seconds(ordered, "CMA")
+    if not expected_step:
+        return [[item] for item in ordered]
+    runs: list[list[dict[str, Any]]] = [[ordered[0]]]
+    for item in ordered[1:]:
+        previous_time = _parse_resource_time(str(runs[-1][-1].get("time_start") or ""))
+        current_time = _parse_resource_time(str(item.get("time_start") or ""))
+        delta = int((current_time - previous_time).total_seconds()) if previous_time and current_time else None
+        if delta == expected_step:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs
+
+
+def _merge_cma_series(items: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(items, key=lambda item: (item.get("time_start") or "", item.get("file_uuid") or ""))
+    base = deepcopy(ordered[-1])
+    times = sorted({time for item in ordered for time in item.get("times") or []})
+    member_ids = [str(item["file_uuid"]) for item in ordered]
+    attributes: dict[str, list[str]] = {}
+    for item in ordered:
+        for name, values in (item.get("attributes") or {}).items():
+            attributes.setdefault(name, []).extend(str(value) for value in values)
+    attributes = {name: sorted(set(values)) for name, values in attributes.items()}
+    identity = json.dumps(
+        [_cma_series_key(base), times[0] if times else "", times[-1] if times else ""],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    series_id = "cma-series-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return {
+        **base,
+        "file_uuid": series_id,
+        "file_uuids": member_ids,
+        "file_name": f"CMA {times[0]} - {times[-1]}" if times else "CMA 时间序列",
+        "times": times,
+        "time_start": times[0] if times else None,
+        "time_end": times[-1] if times else None,
+        "frame_count": len(times),
+        "webp_count": sum(int(item.get("webp_count") or 0) for item in ordered),
+        "elements": sorted({value for item in ordered for value in item.get("elements") or []}),
+        "resolutions": sorted({value for item in ordered for value in item.get("resolutions") or []}),
+        "attributes": attributes,
+        "members": [
+            {
+                "file_uuid": item.get("file_uuid"),
+                "time_start": item.get("time_start"),
+                "time_end": item.get("time_end"),
+            }
+            for item in ordered
+        ],
+        **_continuity("CMA", times),
+    }
+
+
 def _catalog_payloads(resources: list[dict[str, Any]], data_type: str) -> list[dict[str, Any]]:
+    if data_type == "CMA":
+        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for resource in resources:
+            payload = _resource_payload(resource)
+            groups.setdefault(_cma_series_key(payload), []).append(payload)
+        series = [
+            _merge_cma_series(run)
+            for items in groups.values()
+            for run in _split_cma_series_runs(items)
+        ]
+        return sorted(
+            series,
+            key=lambda item: (item.get("time_end") or "", item.get("file_uuid") or ""),
+            reverse=True,
+        )
     if data_type != "WRF":
         return [_resource_payload(item) for item in resources]
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
@@ -952,13 +1073,21 @@ def catalog_series(request: Request, payload: CatalogSeriesPayload) -> dict[str,
             raise HTTPException(status_code=404, detail="序列中的数据不存在或无权访问。")
         resources.append(resource)
     data_types = {str(item.get("data_type") or "").upper() for item in resources}
-    if data_types != {"WRF"}:
-        raise HTTPException(status_code=400, detail="当前版本仅支持合并 WRF 单帧序列。")
     items = [_resource_payload(resource, include_meta=True) for resource in resources]
-    keys = {_wrf_series_key(item) for item in items}
-    if len(keys) != 1:
-        raise HTTPException(status_code=400, detail="所选 WRF 文件不属于同一区域和日期。")
-    return ok(_merge_wrf_series(items))
+    if data_types == {"WRF"}:
+        keys = {_wrf_series_key(item) for item in items}
+        if len(keys) != 1:
+            raise HTTPException(status_code=400, detail="所选 WRF 文件不属于同一区域和日期。")
+        return ok(_merge_wrf_series(items))
+    if data_types == {"CMA"}:
+        keys = {_cma_series_key(item) for item in items}
+        if len(keys) != 1:
+            raise HTTPException(status_code=400, detail="所选 CMA 文件不属于同一产品序列。")
+        merged = _merge_cma_series(items)
+        if not merged.get("continuous"):
+            raise HTTPException(status_code=409, detail="所选 CMA 文件的时间间隔不连续。")
+        return ok(merged)
+    raise HTTPException(status_code=400, detail="当前版本仅支持合并 WRF 或 CMA 单帧序列。")
 
 
 class CollectionPrepareFile(BaseModel):
@@ -1272,22 +1401,20 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
             if collection is None
             else None
         )
+        if duplicate is not None:
+            merged.unlink(missing_ok=True)
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return ok(
+                _task_payload(duplicate, duplicate_content=True),
+                "相同数据已存在，未重复入库或解析",
+            )
+
         file_uuid = str(uuid.uuid4())
         suffix = Path(safe_name).suffix
         destination = _raw_destination(user_uuid, data_type, file_uuid, suffix)
         destination.parent.mkdir(parents=True, exist_ok=False)
-        source_file_uuid = None
         try:
-            existing_raw = _resolve_existing_raw(duplicate["source_path"]) if duplicate else None
-            if duplicate and existing_raw:
-                source_file_uuid = duplicate["file_uuid"]
-                try:
-                    os.link(existing_raw, destination)
-                except OSError:
-                    shutil.copy2(existing_raw, destination)
-                merged.unlink()
-            else:
-                merged.replace(destination)
+            merged.replace(destination)
 
             relative_source = destination.relative_to(RAW_STORAGE_ROOT).as_posix()
             task_values = {
@@ -1302,8 +1429,8 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
                 "source_path": relative_source,
                 "file_size": total_size,
                 "file_hash": file_hash,
-                "source_file_uuid": source_file_uuid,
-                "remark": "same-user SHA-256 duplicate" if source_file_uuid else None,
+                "source_file_uuid": None,
+                "remark": None,
             }
             if collection is not None and collection_role is not None:
                 task, collection = create_satellite_collection_upload_task(
@@ -1365,7 +1492,7 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
         return ok(
             _task_payload(
                 task,
-                duplicate_content=bool(source_file_uuid),
+                duplicate_content=False,
                 collection=collection,
             ),
             message,
