@@ -11,3 +11,5 @@ tmp_chunks/
 
 # macOS
 .DS_Store
+
+tests/

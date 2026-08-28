@@ -22,7 +22,15 @@
 - JWT 除角色外还查询共享 `users` 表，校验账号状态与 `token_version`。
 - 相同用户、相同 `data_type`、相同 SHA-256 的文件直接返回原任务；不再创建 raw 副本、`public_info` 记录或解析任务。
 
-标准单文件类型已改为“只上传一次、数据库入队、Worker 异步解析”，前端不再把同一文件提交给 8002 的 `/api/files/parse`。FY-3 和 Himawari 仍保留现有 `/api/files/raw-upload`、`raw-scenes`、`update` 多文件场景流程，本版本不强制迁移，避免破坏文件配对逻辑。
+标准单文件及 FY-3/Himawari 多文件场景均使用“只上传一次、数据库入队、Worker 异步解析”。8002 的旧 raw 接口仅用于兼容查询，卫星新数据统一通过 8003 集合队列进入系统。
+
+自动采集接口：
+
+- `GET /api/acquisition/{FY3|Himawari}/status`
+- `GET /api/acquisition/{FY3|Himawari}/scenes`
+- `POST /api/acquisition/{FY3|Himawari}/sync`
+
+全局使用 `SATELLITE_ACQUISITION_ENABLED=1` 启用后台轮询。FY-3 使用 NSMC 门户导出的订单下载链接清单 `FY3_NSMC_MANIFEST`（文本 URL 列表或 JSON `files` 数组），并通过 `FY3_NSMC_ENABLED=1` 启用；受保护链接可使用 `FY3_NSMC_TOKEN` 或 `FY3_NSMC_USERNAME`/`FY3_NSMC_PASSWORD`。Himawari 使用 `HIMAWARI_ACQUISITION_ENABLED=1` 及 `HIMAWARI_FTP_USER`、`HIMAWARI_FTP_PASSWORD`。凭据只能放在部署环境中，不能提交到仓库。
 
 当前标准单文件链路：
 

@@ -38,9 +38,15 @@ def install_auth(app, rules) -> None:
         path = request.url.path
         if request.method == "OPTIONS" or path in WHITELIST:
             return await call_next(request)
-        required = next((role for prefix, role in rules if path.startswith(prefix)), None)
-        if required is None:
+        required_rule = next((role for prefix, role in rules if path.startswith(prefix)), None)
+        if required_rule is None:
             return await call_next(request)
+        if isinstance(required_rule, dict):
+            required = required_rule.get(request.method, required_rule.get("*"))
+            if required is None:
+                return await call_next(request)
+        else:
+            required = required_rule
         header = request.headers.get("authorization", "")
         token = header[7:] if header.startswith("Bearer ") else ""
         if not token and path.startswith(STATIC_PREFIXES):
@@ -60,7 +66,7 @@ def install_auth(app, rules) -> None:
             return JSONResponse({"code": 401, "detail": "用户不存在或已被禁用"}, status_code=401)
         if int(payload.get("token_version", 0)) != int(user.get("token_version") or 0):
             return JSONResponse({"code": 401, "detail": "token 已失效，请重新登录"}, status_code=401)
-        if int(user.get("role") or 0) < required:
+        if int(user.get("role") or 0) < int(required):
             return JSONResponse({"code": 403, "detail": "权限不足"}, status_code=403)
 
         request.state.user = user
