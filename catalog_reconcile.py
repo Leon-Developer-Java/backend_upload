@@ -12,13 +12,11 @@ from sqlalchemy import delete, insert, select, update
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_SYSTEM_ROOT = WORKSPACE_ROOT / "backend_system"
-for value in (WORKSPACE_ROOT, BACKEND_SYSTEM_ROOT):
-    if str(value) not in sys.path:
-        sys.path.insert(0, str(value))
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from DB.schema import DETAIL_TABLES, public_info
-from services.asset_catalog import build_asset_catalog
+from backend.services.asset_catalog import build_asset_catalog
 
 
 def _utcnow() -> datetime:

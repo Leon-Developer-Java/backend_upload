@@ -19,7 +19,9 @@ from DB.config import create_database_engine
 from DB.repository import get_active_user
 
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me").strip()
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+if len(JWT_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError("JWT_SECRET 必须配置为至少 32 字节的随机密钥")
 WHITELIST = {"/", "/api/health", "/docs", "/openapi.json"}
 STATIC_PREFIXES = ("/data/", "/outputs/")
 engine = create_database_engine()

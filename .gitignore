@@ -12,4 +12,5 @@ tmp_chunks/
 # macOS
 .DS_Store
 
-tests/
+tests/*
+!tests/test_catalog_startup.py

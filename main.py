@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -15,16 +16,16 @@ import sys
 import uuid
 from copy import deepcopy
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from auth import install_auth, request_user
 
@@ -52,6 +53,7 @@ from DB.repository import (
     list_user_tasks,
     retry_user_satellite_collection,
     retry_user_task,
+    summarize_user_tasks,
 )
 
 
@@ -137,9 +139,20 @@ NOWCAST_VARIABLE = "observation.prdt_crf_raw_log"
 
 
 engine, _ = init_database(import_users=True)
-acquisition_service = AcquisitionService(engine, RAW_STORAGE_ROOT)
+acquisition_service: AcquisitionService | None = None
+acquisition_startup_error = ""
 
-app = FastAPI(title="Weather Data Upload Backend", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    start_acquisition_scheduler()
+    try:
+        yield
+    finally:
+        stop_acquisition_scheduler()
+
+
+app = FastAPI(title="Weather Data Upload Backend", version="0.2.0", lifespan=lifespan)
 
 # Data catalog is readable by signed-in users; uploads still require role 2.
 install_auth(
@@ -169,14 +182,27 @@ def ok(data: Any = None, message: str = "success") -> dict[str, Any]:
     return {"code": 0, "data": data, "message": message}
 
 
-@app.on_event("startup")
 def start_acquisition_scheduler() -> None:
-    acquisition_service.start()
+    global acquisition_service, acquisition_startup_error
+    try:
+        acquisition_service = AcquisitionService(engine, RAW_STORAGE_ROOT)
+        acquisition_service.start()
+        acquisition_startup_error = ""
+    except SQLAlchemyError:
+        acquisition_service = None
+        acquisition_startup_error = "自动采集数据库结构不兼容，请更新共享 DB；数据目录和上传不受影响。"
+        logging.getLogger(__name__).exception(acquisition_startup_error)
 
 
-@app.on_event("shutdown")
 def stop_acquisition_scheduler() -> None:
-    acquisition_service.stop()
+    if acquisition_service is not None:
+        acquisition_service.stop()
+
+
+def _require_acquisition_service() -> AcquisitionService:
+    if acquisition_service is None:
+        raise HTTPException(status_code=503, detail=acquisition_startup_error or "自动采集服务尚未就绪。")
+    return acquisition_service
 
 
 def _acquisition_type(value: str) -> str:
@@ -188,7 +214,7 @@ def _acquisition_type(value: str) -> str:
 
 @app.get("/api/acquisition/{data_type}/status")
 def acquisition_status(data_type: str) -> dict[str, Any]:
-    return ok(acquisition_service.status(_acquisition_type(data_type)))
+    return ok(_require_acquisition_service().status(_acquisition_type(data_type)))
 
 
 @app.get("/api/acquisition/{data_type}/scenes")
@@ -197,15 +223,16 @@ def acquisition_scenes(
     limit: int = Query(default=100, ge=1, le=200),
 ) -> dict[str, Any]:
     normalized = _acquisition_type(data_type)
-    items = acquisition_service.scenes(normalized, limit=limit)
+    items = _require_acquisition_service().scenes(normalized, limit=limit)
     return ok({"data_type": normalized, "items": items, "total": len(items)})
 
 
 @app.post("/api/acquisition/{data_type}/sync")
 def acquisition_sync(data_type: str) -> dict[str, Any]:
     normalized = _acquisition_type(data_type)
+    service = _require_acquisition_service()
     try:
-        return ok(acquisition_service.sync(normalized), "自动采集同步完成")
+        return ok(service.sync(normalized), "自动采集同步完成")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -1575,11 +1602,13 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
 @app.get("/api/upload/tasks")
 def upload_tasks(
     request: Request,
+    response: Response,
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     user = request_user(request)
     tasks, total = list_user_tasks(engine, user["uuid"], limit=limit, offset=offset)
+    summary = summarize_user_tasks(engine, user["uuid"])
     items = []
     collections: dict[str, dict[str, Any] | None] = {}
     for task in tasks:
@@ -1591,7 +1620,15 @@ def upload_tasks(
                 collections[key] = get_user_satellite_collection(engine, user["uuid"], key)
             collection = collections[key]
         items.append(_task_payload(task, collection=collection))
-    return ok({"items": items, "total": total, "limit": limit, "offset": offset})
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return ok({
+        "items": items,
+        "total": total,
+        "summary": summary,
+        "limit": limit,
+        "offset": offset,
+    })
 
 
 @app.get("/api/upload/tasks/{file_uuid}")

@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -88,14 +88,6 @@ class AcquisitionService:
             "Himawari": ("Himawari JAXA HSD", "JAXA", os.getenv("HIMAWARI_FTP_HOST", "ftp.ptree.jaxa.jp")),
         }
         with self.engine.begin() as conn:
-            # SQLite treats NULL values as distinct in a UNIQUE constraint, so
-            # the existing user-owned identity does not protect source-owned
-            # automatic collections. This partial index closes that gap.
-            conn.exec_driver_sql(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_satellite_collection_source_generation "
-                "ON satellite_collection(source_uuid, data_type, scene_key, generation) "
-                "WHERE source_uuid IS NOT NULL"
-            )
             for data_type, (name, provider, base_uri) in definitions.items():
                 source_uuid = self._source_ids[data_type]
                 row = conn.execute(
@@ -374,6 +366,7 @@ class AcquisitionService:
                 replacements[f"{role.split(':', 1)[0]}:"] = roles
             for band in HIMAWARI_BANDS:
                 expected.extend(replacements.get(f"{band}:", [f"{band}:S{index:02d}" for index in range(1, 11)]))
+        source_uuid = self._source_ids[scene.data_type]
         collection = create_or_get_satellite_collection(
             self.engine,
             None,
@@ -381,15 +374,10 @@ class AcquisitionService:
             scene.scene_key,
             expected,
             role_replacements=replacements,
+            source_uuid=source_uuid,
+            remark="automatic acquisition",
         )
         collection_uuid = str(collection["collection_uuid"])
-        source_uuid = self._source_ids[scene.data_type]
-        with self.engine.begin() as conn:
-            conn.execute(
-                update(satellite_collection)
-                .where(satellite_collection.c.collection_uuid == collection_uuid)
-                .values(source_uuid=source_uuid, remark="automatic acquisition")
-            )
         downloaded = 0
         reused = 0
         for member in scene.members:
