@@ -127,7 +127,8 @@ EXPECTED_STEP_SECONDS = {
     "ECMWF": 10800,
     # CMA products use different cadences; infer the step from each series.
     "CMA": None,
-    "RADAR": 600,
+    # 雷达存在 3 分钟和 6 分钟两类，按上传任务记录的时间分辨率判断。
+    "RADAR": None,
     "WRF": 3600,
     "FY3": 300,
     "HIMAWARI": 600,
@@ -154,11 +155,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Weather Data Upload Backend", version="0.2.0", lifespan=lifespan)
 
-# Data catalog is readable by signed-in users; uploads still require role 2.
+# Weather data is shared across signed-in users. Ordinary users may browse the
+# system catalog and upload files; operational acquisition remains role 2.
 install_auth(
     app,
     [
-        ("/api/catalog", {"GET": 1, "POST": 2}),
+        ("/api/catalog", 1),
+        ("/api/upload", 1),
         ("/api/acquisition", {"GET": 1, "POST": 2}),
         ("/api", 2),
     ],
@@ -396,6 +399,7 @@ def _task_payload(
         "update_time": task.get("update_time"),
         "parse_started_at": task.get("parse_started_at"),
         "parse_finished_at": task.get("parse_finished_at"),
+        "radar_interval_minutes": _radar_interval_from_task(task),
     }
     if duplicate_content is not None:
         payload["duplicate_content"] = duplicate_content
@@ -539,24 +543,24 @@ def _parse_resource_time(value: str) -> datetime | None:
         return None
 
 
-def _is_duplicate_content(task: dict[str, Any]) -> bool:
-    return bool(task.get("source_file_uuid"))
-
-
-def _continuity(data_type: str, times: list[str]) -> dict[str, Any]:
+def _continuity(
+    data_type: str,
+    times: list[str],
+    expected_step_seconds: int | None = None,
+) -> dict[str, Any]:
     parsed = [item for item in (_parse_resource_time(value) for value in times) if item]
     if len(parsed) < 2:
         return {
             "continuous": False,
             "playable": False,
-            "expected_step_seconds": EXPECTED_STEP_SECONDS.get(data_type),
+            "expected_step_seconds": expected_step_seconds or EXPECTED_STEP_SECONDS.get(data_type),
             "gaps": [],
             "reason": "仅有 1 帧数据，至少需要 2 帧才能播放。" if parsed else "数据缺少有效时间，无法播放。",
         }
 
     deltas = [int((right - left).total_seconds()) for left, right in zip(parsed, parsed[1:])]
     positive = [delta for delta in deltas if delta > 0]
-    default_step = EXPECTED_STEP_SECONDS.get(data_type)
+    default_step = expected_step_seconds or EXPECTED_STEP_SECONDS.get(data_type)
     if default_step:
         expected = default_step
     elif positive:
@@ -589,6 +593,15 @@ def _resource_payload(resource: dict[str, Any], *, include_meta: bool = False) -
     data_type = str(resource.get("data_type") or "").upper()
     assets = resource.get("assets") or []
     times = _resource_times(resource)
+    resource_meta: dict[str, Any] = {}
+    if include_meta:
+        try:
+            loaded_meta = json.loads(_resource_meta_path(resource).read_text(encoding="utf-8"))
+            if isinstance(loaded_meta, dict):
+                resource_meta = loaded_meta
+        except (HTTPException, OSError, json.JSONDecodeError) as exc:
+            if include_meta:
+                raise HTTPException(status_code=409, detail="该数据的 meta.json 无法读取。") from exc
     elements = sorted({
         str(asset.get("element_key"))
         for asset in resource.get("assets") or []
@@ -648,6 +661,7 @@ def _resource_payload(resource: dict[str, Any], *, include_meta: bool = False) -
             "source_resolutions": "source_resolution",
         },
         "FY3": {
+            "scene_ids": "scene_id",
             "satellites": "satellite",
             "instruments": "instrument",
             "bands": "band",
@@ -655,6 +669,7 @@ def _resource_payload(resource: dict[str, Any], *, include_meta: bool = False) -
             "file_roles": "file_role",
         },
         "HIMAWARI": {
+            "scene_ids": "scene_id",
             "satellites": "satellite",
             "regions": "region",
             "bands": "band",
@@ -671,6 +686,7 @@ def _resource_payload(resource: dict[str, Any], *, include_meta: bool = False) -
         )
         for name, field in attribute_fields.items()
     }
+    radar_interval = _radar_interval_from_task(resource) if data_type == "RADAR" else None
     payload = {
         "file_uuid": resource.get("file_uuid"),
         "data_type": data_type,
@@ -691,28 +707,171 @@ def _resource_payload(resource: dict[str, Any], *, include_meta: bool = False) -
         "elements": elements,
         "resolutions": resolutions,
         "attributes": attributes,
-        **_continuity(data_type, times),
+        "radar_interval_minutes": radar_interval,
+        **_continuity(data_type, times, radar_interval * 60 if radar_interval else None),
     }
     if include_meta:
-        meta_path = _resource_meta_path(resource)
-        try:
-            payload["meta"] = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=409, detail="该数据的 meta.json 无法读取。") from exc
+        payload["meta"] = resource_meta
     return payload
 
 
-def _wrf_series_key(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+def _radar_interval_from_task(task: dict[str, Any]) -> int | None:
+    remark = task.get("remark")
+    if remark:
+        try:
+            value = json.loads(str(remark)).get("radar_interval_minutes")
+            if int(value) in {3, 6}:
+                return int(value)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if task.get("meta_path"):
+        try:
+            meta = json.loads(_resource_meta_path(task).read_text(encoding="utf-8"))
+            seconds = float((meta.get("time_detail") or {}).get("step_seconds"))
+            minutes = int(round(seconds / 60))
+            if minutes in {3, 6}:
+                return minutes
+        except (HTTPException, OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return None
+
+
+def _radar_series_key(payload: dict[str, Any]) -> tuple[Any, ...]:
+    attributes = payload.get("attributes") or {}
+    return (
+        tuple(attributes.get("radar_names") or []),
+        tuple(attributes.get("radar_types") or []),
+        int(payload.get("radar_interval_minutes") or 0),
+    )
+
+
+def _split_series_runs(
+    items: list[dict[str, Any]],
+    *,
+    expected_step_seconds: int | None = None,
+    max_inferred_step_seconds: int | None = None,
+) -> list[list[dict[str, Any]]]:
+    by_time: dict[str, dict[str, Any]] = {}
+    for item in sorted(
+        items,
+        key=lambda value: (
+            value.get("parse_finished_at") or value.get("create_time") or "",
+            value.get("file_uuid") or "",
+        ),
+        reverse=True,
+    ):
+        time_key = str(item.get("time_start") or "")
+        if time_key and time_key not in by_time:
+            by_time[time_key] = item
+    ordered = sorted(by_time.values(), key=lambda item: item.get("time_start") or "")
+    if not ordered:
+        return []
+
+    expected = int(expected_step_seconds or 0)
+    inferred = False
+    if not expected and len(ordered) > 1:
+        deltas = []
+        for previous_item, current_item in zip(ordered, ordered[1:]):
+            previous = _parse_resource_time(str(previous_item.get("time_start") or ""))
+            current = _parse_resource_time(str(current_item.get("time_start") or ""))
+            delta = int((current - previous).total_seconds()) if previous and current else 0
+            if delta > 0:
+                deltas.append(delta)
+        if deltas:
+            counts = Counter(deltas)
+            expected = min(counts, key=lambda value: (-counts[value], value))
+            inferred = True
+    if inferred and max_inferred_step_seconds and expected > max_inferred_step_seconds:
+        expected = 0
+    if not expected:
+        return [[item] for item in ordered]
+
+    runs: list[list[dict[str, Any]]] = [[ordered[0]]]
+    for item in ordered[1:]:
+        previous = _parse_resource_time(str(runs[-1][-1].get("time_start") or ""))
+        current = _parse_resource_time(str(item.get("time_start") or ""))
+        delta = int((current - previous).total_seconds()) if previous and current else None
+        if delta == expected:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs
+
+
+def _merge_radar_series(items: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(items, key=lambda item: (item.get("time_start") or "", item.get("file_uuid") or ""))
+    base = deepcopy(ordered[0])
+    meta = deepcopy(base.get("meta") or {})
+    times = [str(item.get("time_start")) for item in ordered if item.get("time_start")]
+    frames = []
+    for index, item in enumerate(ordered):
+        item_meta = item.get("meta") or {}
+        weather = item_meta.get("weather_info") if isinstance(item_meta.get("weather_info"), dict) else {}
+        frame_time = str(item.get("time_start") or (item_meta.get("times") or [""])[0])
+        webp = item_meta.get("default_webp") or item.get("default_webp_url")
+        frames.append({
+            "index": index,
+            "file": item.get("file_name") or item_meta.get("file"),
+            "source_file": item_meta.get("source_file"),
+            "meta_file": item.get("meta_path"),
+            "time": frame_time,
+            "time_label": weather.get("time") or frame_time,
+            "extent": item_meta.get("extent") or item_meta.get("bbox") or weather.get("extent"),
+            "webp": webp,
+            "webp_url": webp,
+            "default_webp": webp,
+            "weather_info": weather,
+        })
+    interval = int(base.get("radar_interval_minutes") or 0)
+    weather_info = deepcopy(meta.get("weather_info") or {})
+    weather_info.update({
+        "time": f"{times[0]} - {times[-1]}" if times else weather_info.get("time", ""),
+        "times": times,
+        "step_count": len(frames),
+        "steps": str(len(frames)),
+        "temporal_resolution": f"{interval} 分钟" if interval else "",
+        "status": "loaded_recent_series",
+    })
+    meta.update({
+        "file": f"{len(frames)} radar files",
+        "file_name": f"{len(frames)} radar files",
+        "meta_file": None,
+        "source_files": [frame["source_file"] for frame in frames if frame.get("source_file")],
+        "webp_files": [frame["webp_url"] for frame in frames if frame.get("webp_url")],
+        "default_webp": frames[0].get("webp_url") if frames else meta.get("default_webp"),
+        "times": times,
+        "frames": frames,
+        "weather_info": weather_info,
+    })
+    identity = json.dumps([_radar_series_key(base), times[0] if times else "", times[-1] if times else ""], separators=(",", ":"))
+    continuity = _continuity("RADAR", times, interval * 60 if interval else None)
+    return {
+        **base,
+        "file_uuid": "radar-series-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16],
+        "file_uuids": [str(item["file_uuid"]) for item in ordered],
+        "file_name": f"雷达 {times[0]} - {times[-1]}" if times else "雷达时间序列",
+        "meta_path": None,
+        "meta": meta,
+        "times": times,
+        "time_start": times[0] if times else None,
+        "time_end": times[-1] if times else None,
+        "frame_count": len(frames),
+        "webp_count": sum(int(item.get("webp_count") or 0) for item in ordered),
+        "members": [
+            {"file_uuid": item.get("file_uuid"), "time_start": item.get("time_start"), "time_end": item.get("time_end")}
+            for item in ordered
+        ],
+        **continuity,
+    }
+
+
+def _wrf_series_key(payload: dict[str, Any]) -> tuple[str, str]:
     name = str(payload.get("file_name") or "")
     lowered = name.lower()
     domain = next((part for part in ("d01", "d02", "d03", "d04") if f"wrfout_{part}" in lowered), "unknown")
-    day = str(payload.get("time_start") or "")[:10]
-    return (
-        str(payload.get("owner_uuid") or "public"),
-        str(payload.get("visibility") or "private"),
-        domain,
-        day,
-    )
+    references = (payload.get("attributes") or {}).get("forecast_reference_times") or []
+    run_key = str(references[0]) if references else str(payload.get("time_start") or "")[:10]
+    return domain, run_key
 
 
 def _merge_wrf_series(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -757,8 +916,8 @@ def _merge_wrf_series(items: list[dict[str, Any]]) -> dict[str, Any]:
     series_key = "|".join(_wrf_series_key(base))
     series_id = "wrf-series-" + hashlib.sha256(series_key.encode("utf-8")).hexdigest()[:16]
     continuity = _continuity("WRF", times)
-    domain = _wrf_series_key(base)[2]
-    day = _wrf_series_key(base)[3]
+    domain, _ = _wrf_series_key(base)
+    day = str(times[0] if times else base.get("time_start") or "")[:10]
     attributes: dict[str, list[str]] = {}
     for item in ordered:
         for name, values in (item.get("attributes") or {}).items():
@@ -795,8 +954,6 @@ def _merge_wrf_series(items: list[dict[str, Any]]) -> dict[str, Any]:
 def _cma_series_key(payload: dict[str, Any]) -> tuple[Any, ...]:
     attributes = payload.get("attributes") or {}
     return (
-        str(payload.get("owner_uuid") or "public"),
-        str(payload.get("visibility") or "private"),
         tuple(payload.get("elements") or []),
         tuple(payload.get("resolutions") or []),
         tuple(attributes.get("product_types") or []),
@@ -804,56 +961,20 @@ def _cma_series_key(payload: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _series_step_seconds(items: list[dict[str, Any]], data_type: str) -> int | None:
-    parsed = sorted({
-        value
-        for item in items
-        if (value := _parse_resource_time(str(item.get("time_start") or ""))) is not None
-    })
-    default_step = EXPECTED_STEP_SECONDS.get(data_type)
-    if default_step:
-        return int(default_step)
-    deltas = [
-        int((right - left).total_seconds())
-        for left, right in zip(parsed, parsed[1:])
-        if right > left
-    ]
-    if not deltas:
+def _cma_series_step_seconds(items: list[dict[str, Any]]) -> int | None:
+    values = []
+    for item in items:
+        meta = item.get("meta") or {}
+        try:
+            value = int((meta.get("time_detail") or {}).get("step_seconds") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            values.append(value)
+    if not values:
         return None
-    counts = Counter(deltas)
+    counts = Counter(values)
     return min(counts, key=lambda value: (-counts[value], value))
-
-
-def _split_cma_series_runs(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    by_time: dict[str, dict[str, Any]] = {}
-    for item in sorted(
-        items,
-        key=lambda value: (
-            value.get("parse_finished_at") or value.get("create_time") or "",
-            value.get("file_uuid") or "",
-        ),
-        reverse=True,
-    ):
-        time_key = str(item.get("time_start") or "")
-        if time_key and time_key not in by_time:
-            by_time[time_key] = item
-    ordered = sorted(by_time.values(), key=lambda item: item.get("time_start") or "")
-    if len(ordered) < 2:
-        return [ordered] if ordered else []
-
-    expected_step = _series_step_seconds(ordered, "CMA")
-    if not expected_step:
-        return [[item] for item in ordered]
-    runs: list[list[dict[str, Any]]] = [[ordered[0]]]
-    for item in ordered[1:]:
-        previous_time = _parse_resource_time(str(runs[-1][-1].get("time_start") or ""))
-        current_time = _parse_resource_time(str(item.get("time_start") or ""))
-        delta = int((current_time - previous_time).total_seconds()) if previous_time and current_time else None
-        if delta == expected_step:
-            runs[-1].append(item)
-        else:
-            runs.append([item])
-    return runs
 
 
 def _merge_cma_series(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -861,6 +982,40 @@ def _merge_cma_series(items: list[dict[str, Any]]) -> dict[str, Any]:
     base = deepcopy(ordered[-1])
     times = sorted({time for item in ordered for time in item.get("times") or []})
     member_ids = [str(item["file_uuid"]) for item in ordered]
+    meta = deepcopy(base.get("meta") or {})
+    frames = []
+    for item in ordered:
+        item_meta = item.get("meta") or {}
+        item_frames = item_meta.get("frames") if isinstance(item_meta.get("frames"), list) else []
+        item_times = item.get("times") or [item.get("time_start")]
+        for frame_index, frame_time in enumerate(item_times):
+            if not frame_time:
+                continue
+            source_frame = item_frames[min(frame_index, len(item_frames) - 1)] if item_frames else {}
+            webp_files = item_meta.get("webp_files") if isinstance(item_meta.get("webp_files"), list) else []
+            source_files = item_meta.get("source_files") if isinstance(item_meta.get("source_files"), list) else []
+            frames.append({
+                **source_frame,
+                "time": str(frame_time),
+                "time_label": source_frame.get("time_label") or str(frame_time),
+                "meta_file": item.get("meta_path") or item_meta.get("meta_file"),
+                "source_file": source_frame.get("source_file")
+                    or (source_files[min(frame_index, len(source_files) - 1)] if source_files else item_meta.get("source_file")),
+                "webp_url": source_frame.get("webp_url")
+                    or source_frame.get("webp")
+                    or (webp_files[min(frame_index, len(webp_files) - 1)] if webp_files else item.get("default_webp_url")),
+            })
+    frames.sort(key=lambda frame: frame.get("time") or "")
+    for index, frame in enumerate(frames):
+        frame["index"] = index
+    meta.update({
+        "meta_file": None,
+        "times": [str(frame["time"]) for frame in frames],
+        "frames": frames,
+        "source_files": [frame.get("source_file") for frame in frames if frame.get("source_file")],
+        "webp_files": [frame.get("webp_url") for frame in frames if frame.get("webp_url")],
+        "default_webp": frames[0].get("webp_url") if frames else meta.get("default_webp"),
+    })
     attributes: dict[str, list[str]] = {}
     for item in ordered:
         for name, values in (item.get("attributes") or {}).items():
@@ -877,6 +1032,8 @@ def _merge_cma_series(items: list[dict[str, Any]]) -> dict[str, Any]:
         "file_uuid": series_id,
         "file_uuids": member_ids,
         "file_name": f"CMA {times[0]} - {times[-1]}" if times else "CMA 时间序列",
+        "meta_path": None,
+        "meta": meta,
         "times": times,
         "time_start": times[0] if times else None,
         "time_end": times[-1] if times else None,
@@ -898,15 +1055,37 @@ def _merge_cma_series(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _catalog_payloads(resources: list[dict[str, Any]], data_type: str) -> list[dict[str, Any]]:
+    if data_type == "RADAR":
+        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for resource in resources:
+            payload = _resource_payload(resource, include_meta=True)
+            groups.setdefault(_radar_series_key(payload), []).append(payload)
+        series = [
+            _merge_radar_series(run)
+            for items in groups.values()
+            for run in _split_series_runs(
+                items,
+                expected_step_seconds=int(items[0].get("radar_interval_minutes") or 0) * 60,
+            )
+        ]
+        return sorted(
+            series,
+            key=lambda item: (item.get("time_end") or "", item.get("file_uuid") or ""),
+            reverse=True,
+        )
     if data_type == "CMA":
         groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         for resource in resources:
-            payload = _resource_payload(resource)
+            payload = _resource_payload(resource, include_meta=True)
             groups.setdefault(_cma_series_key(payload), []).append(payload)
         series = [
             _merge_cma_series(run)
             for items in groups.values()
-            for run in _split_cma_series_runs(items)
+            for run in _split_series_runs(
+                items,
+                expected_step_seconds=_cma_series_step_seconds(items),
+                max_inferred_step_seconds=24 * 60 * 60,
+            )
         ]
         return sorted(
             series,
@@ -915,11 +1094,20 @@ def _catalog_payloads(resources: list[dict[str, Any]], data_type: str) -> list[d
         )
     if data_type != "WRF":
         return [_resource_payload(item) for item in resources]
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for resource in resources:
         payload = _resource_payload(resource, include_meta=True)
         groups.setdefault(_wrf_series_key(payload), []).append(payload)
-    return [_merge_wrf_series(items) for items in groups.values()]
+    series = [
+        _merge_wrf_series(run)
+        for items in groups.values()
+        for run in _split_series_runs(items, expected_step_seconds=EXPECTED_STEP_SECONDS["WRF"])
+    ]
+    return sorted(
+        series,
+        key=lambda item: (item.get("time_end") or "", item.get("file_uuid") or ""),
+        reverse=True,
+    )
 
 
 @contextmanager
@@ -1179,11 +1367,13 @@ def catalog_series(request: Request, payload: CatalogSeriesPayload) -> dict[str,
         keys = {_cma_series_key(item) for item in items}
         if len(keys) != 1:
             raise HTTPException(status_code=400, detail="所选 CMA 文件不属于同一产品序列。")
-        merged = _merge_cma_series(items)
-        if not merged.get("continuous"):
-            raise HTTPException(status_code=409, detail="所选 CMA 文件的时间间隔不连续。")
-        return ok(merged)
-    raise HTTPException(status_code=400, detail="当前版本仅支持合并 WRF 或 CMA 单帧序列。")
+        return ok(_merge_cma_series(items))
+    if data_types == {"RADAR"}:
+        keys = {_radar_series_key(item) for item in items}
+        if len(keys) != 1:
+            raise HTTPException(status_code=400, detail="所选雷达文件不属于同一雷达或时间分辨率。")
+        return ok(_merge_radar_series(items))
+    raise HTTPException(status_code=400, detail="当前版本仅支持合并 WRF、CMA 或雷达单帧序列。")
 
 
 class CollectionPrepareFile(BaseModel):
@@ -1304,7 +1494,7 @@ def upload_status(request: Request, file_id: str) -> dict[str, Any]:
             "uploaded": [],
             "completed": _task_payload(
                 completed,
-                duplicate_content=_is_duplicate_content(completed),
+                duplicate_content=True,
                 collection=collection,
             ),
         })
@@ -1368,6 +1558,7 @@ class CompletePayload(BaseModel):
     data_type: str
     collection_uuid: str | None = None
     collection_role: str | None = None
+    radar_interval_minutes: int | None = None
 
 
 @app.post("/api/upload/complete")
@@ -1376,6 +1567,10 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
     user_uuid = user["uuid"]
     data_type = normalize_data_type(payload.data_type)
     _validate_queued_upload_type(data_type)
+    if data_type.upper() == "RADAR" and payload.radar_interval_minutes not in {3, 6}:
+        raise HTTPException(status_code=400, detail="雷达数据必须选择 3 分钟或 6 分钟时间分辨率。")
+    if data_type.upper() != "RADAR" and payload.radar_interval_minutes is not None:
+        raise HTTPException(status_code=400, detail="只有雷达数据可以指定时间分辨率。")
     _validate_total_chunks(payload.total_chunks)
     safe_name = _safe_original_name(payload.file_name, data_type)
     upload_session_id = safe_file_id(payload.file_id)
@@ -1410,7 +1605,7 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
         return ok(
             _task_payload(
                 completed,
-                duplicate_content=_is_duplicate_content(completed),
+                duplicate_content=True,
                 collection=completed_collection,
             )
         )
@@ -1429,7 +1624,7 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
             return ok(
                 _task_payload(
                     completed,
-                    duplicate_content=_is_duplicate_content(completed),
+                    duplicate_content=True,
                     collection=completed_collection,
                 )
             )
@@ -1502,6 +1697,12 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
             else None
         )
         if duplicate is not None:
+            existing_interval = _radar_interval_from_task(duplicate) if data_type.upper() == "RADAR" else None
+            if existing_interval is not None and existing_interval != payload.radar_interval_minutes:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"该雷达文件实际按 {existing_interval} 分钟分辨率入库，与当前选择不一致。",
+                )
             merged.unlink(missing_ok=True)
             shutil.rmtree(target_dir, ignore_errors=True)
             return ok(
@@ -1530,7 +1731,11 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
                 "file_size": total_size,
                 "file_hash": file_hash,
                 "source_file_uuid": None,
-                "remark": None,
+                "remark": (
+                    json.dumps({"radar_interval_minutes": payload.radar_interval_minutes}, ensure_ascii=False)
+                    if data_type.upper() == "RADAR"
+                    else None
+                ),
             }
             if collection is not None and collection_role is not None:
                 task, collection = create_satellite_collection_upload_task(
@@ -1561,7 +1766,7 @@ def upload_complete(request: Request, payload: CompletePayload) -> dict[str, Any
                 return ok(
                     _task_payload(
                         completed,
-                        duplicate_content=_is_duplicate_content(completed),
+                        duplicate_content=True,
                         collection=completed_collection,
                     )
                 )
@@ -1647,8 +1852,16 @@ def upload_task(request: Request, file_uuid: str) -> dict[str, Any]:
     return ok(_task_payload(task, collection=collection))
 
 
+class RetryUploadTaskPayload(BaseModel):
+    radar_interval_minutes: int | None = None
+
+
 @app.post("/api/upload/tasks/{file_uuid}/retry")
-def retry_upload_task(request: Request, file_uuid: str) -> dict[str, Any]:
+def retry_upload_task(
+    request: Request,
+    file_uuid: str,
+    payload: RetryUploadTaskPayload | None = None,
+) -> dict[str, Any]:
     user = request_user(request)
     existing = get_user_task(engine, user["uuid"], file_uuid)
     if existing and existing.get("collection_uuid"):
@@ -1656,7 +1869,14 @@ def retry_upload_task(request: Request, file_uuid: str) -> dict[str, Any]:
             status_code=409,
             detail="卫星集合成员不能单独重试，请使用集合重试接口。",
         )
-    task = retry_user_task(engine, user["uuid"], file_uuid)
+    interval = payload.radar_interval_minutes if payload else None
+    if interval is not None:
+        if not existing or str(existing.get("data_type") or "").upper() != "RADAR":
+            raise HTTPException(status_code=400, detail="只有雷达任务可以修改时间分辨率。")
+        if interval not in {3, 6}:
+            raise HTTPException(status_code=400, detail="雷达时间分辨率只能是 3 分钟或 6 分钟。")
+    remark = json.dumps({"radar_interval_minutes": interval}, ensure_ascii=False) if interval else None
+    task = retry_user_task(engine, user["uuid"], file_uuid, remark=remark)
     if task is None:
         raise HTTPException(status_code=409, detail="仅失败任务可以重新进入解析队列。")
     return ok(_task_payload(task), "任务已重新进入解析队列")
