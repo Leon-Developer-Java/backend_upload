@@ -332,7 +332,7 @@ class AcquisitionService:
                     assert match is not None
                     key = (
                         f"H{match.group('sat')}_{date}_{scene_time}_"
-                        f"{match.group('region').upper()}_{match.group('resolution').upper()}"
+                        f"{match.group('region').upper()}"
                     )
                     scenes.append(RemoteScene("Himawari", key, tuple(members)))
             return scenes
@@ -348,7 +348,7 @@ class AcquisitionService:
             match = FY3_RE.match(name)
             if not match:
                 raise ValueError(f"无法识别 FY-3 文件：{name}")
-            return ("science" if match.group("role").upper() == "1000M_MS" else "geo", ["science", "geo"])
+            return ("science" if match.group("role").upper() == "1000M_MS" else "geo", ["science"])
         match = HSD_RE.match(name)
         if not match:
             raise ValueError(f"无法识别 Himawari 文件：{name}")
@@ -358,7 +358,7 @@ class AcquisitionService:
         return f"{band}:S{segment:02d}", [f"{band}:S{index:02d}" for index in range(1, total + 1)]
 
     def _ingest_scene(self, scene: RemoteScene) -> dict[str, Any]:
-        expected = ["science", "geo"] if scene.data_type == "FY3" else []
+        expected = ["science"] if scene.data_type == "FY3" else []
         replacements: dict[str, list[str]] = {}
         if scene.data_type == "Himawari":
             for member in scene.members:
@@ -376,6 +376,7 @@ class AcquisitionService:
             role_replacements=replacements,
             source_uuid=source_uuid,
             remark="automatic acquisition",
+            replace_expected_roles=scene.data_type == "FY3",
         )
         collection_uuid = str(collection["collection_uuid"])
         downloaded = 0

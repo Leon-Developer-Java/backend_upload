@@ -105,6 +105,12 @@ ALLOWED_SUFFIXES = {
 QUEUED_UPLOAD_TYPES = {"ERA5", "GFS", "ECMWF", "CMA", "Radar", "WRF", "FY3", "Himawari"}
 SATELLITE_UPLOAD_TYPES = {"FY3", "Himawari"}
 HIMAWARI_DEFAULT_BANDS = ("B01", "B02", "B03", "B13")
+HIMAWARI_NATIVE_RESOLUTIONS = {
+    "B01": "R10",
+    "B02": "R10",
+    "B03": "R05",
+    "B13": "R20",
+}
 HIMAWARI_DEFAULT_SEGMENTS = max(1, int(os.getenv("HIMAWARI_EXPECTED_SEGMENTS", "10")))
 FY3_SCIENCE_RE = re.compile(
     r"^FY3(?P<sat>[A-Z])_MERSI_GBAL_L1_(?P<date>\d{8})_(?P<time>\d{4})_1000M_MS\.HDF$",
@@ -348,6 +354,15 @@ def _satellite_descriptor(file_name: str, data_type: str) -> dict[str, Any]:
                 status_code=400,
                 detail=f"集合 Worker 当前只接收默认通道：{','.join(HIMAWARI_DEFAULT_BANDS)}。",
             )
+        resolution = match.group("resolution").upper()
+        if resolution != HIMAWARI_NATIVE_RESOLUTIONS[band]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"葵花通道 {band} 的原生分辨率应为 "
+                    f"{HIMAWARI_NATIVE_RESOLUTIONS[band]}，实际为 {resolution}。"
+                ),
+            )
         segment = int(match.group("segment"))
         total = int(match.group("total"))
         if segment < 1 or total < 1 or segment > total:
@@ -355,7 +370,7 @@ def _satellite_descriptor(file_name: str, data_type: str) -> dict[str, Any]:
         return {
             "scene_key": (
                 f"H{match.group('sat')}_{match.group('date')}_{match.group('time')}_"
-                f"{match.group('region').upper()}_{match.group('resolution').upper()}"
+                f"{match.group('region').upper()}"
             ),
             "role": f"{band}:S{segment:02d}",
             "role_group": f"{band}:",
@@ -366,7 +381,7 @@ def _satellite_descriptor(file_name: str, data_type: str) -> dict[str, Any]:
 
 def _initial_satellite_roles(data_type: str) -> list[str]:
     if data_type == "FY3":
-        return ["science", "geo"]
+        return ["science"]
     return [
         f"{band}:S{index:02d}"
         for band in HIMAWARI_DEFAULT_BANDS
@@ -1428,6 +1443,7 @@ def prepare_upload_collections(
             scene_key,
             sorted(expected_roles),
             role_replacements=replacements,
+            replace_expected_roles=data_type == "FY3",
         )
         collections.append(collection)
         for item, descriptor in items:
