@@ -7,6 +7,7 @@ pending row to public_info. Parsing is intentionally handled by Adapter Worker.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -14,6 +15,8 @@ import re
 import shutil
 import sys
 import uuid
+import urllib.error
+import urllib.request
 from copy import deepcopy
 from collections import Counter
 from contextlib import asynccontextmanager, contextmanager
@@ -25,6 +28,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from auth import install_auth, request_user
@@ -55,6 +59,7 @@ from DB.repository import (
     retry_user_task,
     summarize_user_tasks,
 )
+from DB.schema import public_info
 
 
 RAW_STORAGE_ROOT = Path(
@@ -65,7 +70,7 @@ TMP_STORAGE_ROOT = Path(
 ).resolve()
 TEMP_DIR = TMP_STORAGE_ROOT / "uploads"
 PRODUCT_DATA_ROOT = Path(
-    os.getenv("PRODUCT_DATA_ROOT", str(WORKSPACE_ROOT / "backend" / "data"))
+    os.getenv("PRODUCT_DATA_ROOT", str(WORKSPACE_ROOT / "backend_system" / "data"))
 ).resolve()
 
 
@@ -1176,6 +1181,51 @@ def _resolve_existing_raw(source_path: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _internal_terrain_resource(file_uuid: str) -> tuple[dict[str, Any], Path]:
+    with engine.connect() as conn:
+        row = conn.execute(select(public_info).where(
+            public_info.c.file_uuid == file_uuid,
+            public_info.c.ingest_status == "success",
+            public_info.c.is_deleted.is_(False),
+            public_info.c.source_file_uuid.is_(None),
+        )).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="归档资产不存在")
+    resource = dict(row._mapping)
+    source = _resolve_existing_raw(str(resource.get("source_path") or ""))
+    if source is None:
+        raise HTTPException(status_code=409, detail="归档资产文件不可用")
+    checksum = hashlib.sha256()
+    with source.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            checksum.update(chunk)
+    digest = checksum.hexdigest()
+    if digest != str(resource.get("file_hash") or "").lower():
+        raise HTTPException(status_code=409, detail="归档资产哈希与数据库不一致")
+    return resource, source
+
+
+@app.get("/api/internal/terrain-assets/{file_uuid}/manifest")
+def internal_terrain_manifest(file_uuid: str) -> dict[str, Any]:
+    resource, source = _internal_terrain_resource(file_uuid)
+    return ok({
+        "file_uuid": file_uuid,
+        "file_name": Path(str(resource.get("original_file_name") or source.name)).name,
+        "size_bytes": source.stat().st_size,
+        "sha256": str(resource["file_hash"]).lower(),
+    })
+
+
+@app.get("/api/internal/terrain-assets/{file_uuid}/content")
+def internal_terrain_content(file_uuid: str) -> FileResponse:
+    resource, source = _internal_terrain_resource(file_uuid)
+    return FileResponse(
+        source, media_type="application/octet-stream",
+        filename=Path(str(resource.get("original_file_name") or source.name)).name,
+        headers={"X-Weather-File-UUID": file_uuid, "X-Weather-File-SHA256": str(resource["file_hash"]).lower()},
+    )
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return ok({"service": "weather-data-upload-backend", "docs": "/docs"})
@@ -1896,6 +1946,100 @@ def retry_upload_task(
     if task is None:
         raise HTTPException(status_code=409, detail="仅失败任务可以重新进入解析队列。")
     return ok(_task_payload(task), "任务已重新进入解析队列")
+
+
+class AgentParsePayload(BaseModel):
+    file_path: str = Field(min_length=1, max_length=4096)
+    business_type: str = Field(default="", max_length=32)
+    source_digest: str = Field(default="", max_length=64)
+
+
+def _agent_parse_source(value: str) -> Path:
+    source = Path(value)
+    if not source.is_absolute():
+        normalized = value.replace("\\", "/")
+        source = (
+            WORKSPACE_ROOT / source
+            if normalized.startswith("backend_system/data/")
+            else PRODUCT_DATA_ROOT / source
+        )
+    source = source.resolve()
+    try:
+        source.relative_to(PRODUCT_DATA_ROOT)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="文件不在 backend_system/data 内") from exc
+    if not source.is_file() or source.name.endswith(".meta.json"):
+        raise HTTPException(status_code=400, detail="需要提供存在的原始数据文件")
+    return source
+
+
+@app.post("/api/agent-actions/parse-existing/preview")
+def preview_agent_parse(payload: AgentParsePayload) -> dict[str, Any]:
+    source = _agent_parse_source(payload.file_path)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    return ok(
+        {
+            "status": "ok",
+            "summary": "解析预演通过；执行前需要用户确认。",
+            "guardrail": {
+                "allowed": True,
+                "risk_level": "medium",
+                "requires_confirmation": True,
+            },
+            "action": {
+                "action_id": "parse_existing_file",
+                "parameters": {
+                    "file_path": str(source),
+                    "business_type": payload.business_type,
+                },
+                "requires_confirmation": True,
+                "confirm_prompt": f"确认解析 {source}",
+            },
+            "source_digest": digest,
+        },
+    )
+
+
+@app.post("/api/agent-actions/parse-existing/execute")
+def execute_agent_parse(request: Request, payload: AgentParsePayload) -> dict[str, Any]:
+    source = _agent_parse_source(payload.file_path)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if not payload.source_digest or not hmac.compare_digest(
+        digest,
+        payload.source_digest.lower(),
+    ):
+        raise HTTPException(status_code=409, detail="源文件已变化，请重新预演并确认")
+    body = json.dumps(
+        {"file_path": str(source), "business_type": payload.business_type},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    target = os.getenv("BACKEND_SYSTEM_BASE", "http://127.0.0.1:8002").rstrip("/")
+    outbound = urllib.request.Request(
+        f"{target}/api/internal/parse-existing",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": request.headers.get("authorization", ""),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(outbound, timeout=330) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=detail) from exc
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    return ok(
+        {
+            "status": "ok",
+            "summary": f"已提交并完成解析 {source.name}。",
+            "action_result": data,
+            "data": data,
+            "sources": [{"source_file": str(source)}],
+            "warnings": data.get("warnings") or [],
+        },
+    )
 
 
 if __name__ == "__main__":

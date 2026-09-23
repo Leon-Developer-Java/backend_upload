@@ -16,7 +16,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from DB.schema import DETAIL_TABLES, public_info
-from backend.services.asset_catalog import build_asset_catalog
+from backend_system.services.asset_catalog import build_asset_catalog
 
 
 def _utcnow() -> datetime:

@@ -13,4 +13,4 @@ tmp_chunks/
 .DS_Store
 
 tests/*
-!tests/test_catalog_startup.py
+tests/test_catalog_startup.py

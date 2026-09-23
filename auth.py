@@ -1,3 +1,4 @@
+import hmac
 import os
 import sys
 from pathlib import Path
@@ -38,6 +39,13 @@ def install_auth(app, rules) -> None:
     @app.middleware("http")
     async def check_token(request, call_next):
         path = request.url.path
+        if path.startswith("/api/internal/terrain-assets/"):
+            expected = os.getenv("TERRAIN_ARTIFACT_SERVICE_TOKEN", "").strip()
+            supplied = request.headers.get("x-weather-service-token", "").strip()
+            if len(expected) < 32 or not hmac.compare_digest(supplied, expected):
+                return JSONResponse({"code": 401, "detail": "内部资产服务凭据无效"}, status_code=401)
+            request.state.service = "backend_wrf"
+            return await call_next(request)
         if request.method == "OPTIONS" or path in WHITELIST:
             return await call_next(request)
         required_rule = next((role for prefix, role in rules if path.startswith(prefix)), None)
